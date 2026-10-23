@@ -1,0 +1,22 @@
+{
+  "$comment": "dsh-web 双运行时版本清单。两个运行时都取「最新版本」：Node 走 Current 线（不是 LTS），Bun 取最新稳定。生产镜像里两者都装，用 DSH_RUNTIME 环境变量启动时选一个。",
+  "schemaVersion": 1,
+  "runtimes": {
+    "node": {
+      "displayName": "Node.js",
+      "version": "26.12.1",
+      "channel": "current",
+      "minimumVersion": "22.18.0",
+      "reason": "≥ 22.18 才有原生 TypeScript type stripping（可直接 node src/server/main.ts），且 dsh-agent-loop 用到 Promise.withResolvers。",
+      "reference": "https://github.com/nodejs/node/tree/v26.12.1"
+    },
+    "bun": {
+      "displayName": "Bun",
+      "version": "1.4.4",
+      "channel": "stable",
+      "minimumVersion": "1.4.4",
+      "reason": "更早的 Bun 缺 node:util.getSystemErrorMessage；1.4.4 是目前最新稳定版。",
+      "reference": "https://github.com/oven-sh/bun/tree/bun-v1.4.4"
+    }
+  }
+}

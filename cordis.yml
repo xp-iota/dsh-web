@@ -1,0 +1,8 @@
+# dsh-web 的根配置：空入口表。
+#
+# 所有行都由同目录的 cordis.patch.yml 以一次 insert 挂载（与官方 sdk-minimal
+# profile 的写法一致）。根文件保持"零行"，patch 文件是唯一的装配清单。
+#
+# 加载顺序：boot('dsh-web', <本文件>, [cordis.patch.yml]) →
+#   Loader 载入本文件（空表）→ 应用 patch 层（insert 全部行）。
+[]

@@ -1,0 +1,24 @@
+# 构建上下文里不要的东西。
+#
+# 依赖与前端产物都在镜像里重新装/重新构建，带进去只会让构建变慢、缓存失效，
+# 还可能把本机的平台二进制（.node）错误地带进 linux 镜像。
+
+node_modules
+web/node_modules
+web/dist
+web/tsconfig.tsbuildinfo
+
+# 会话数据：绝不能进镜像（也不该进版本库）
+.dsh-home
+tmp
+
+.git
+.gitignore
+*.log
+npm-debug.log*
+
+# 本机开发用的编辑器/系统文件
+.vscode
+.idea
+.DS_Store
+Thumbs.db

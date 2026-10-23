@@ -1,0 +1,75 @@
+# dsh-web 生产编排
+#
+# ── 用法 ────────────────────────────────────────────────────────────
+#     # 1. 准备环境变量（密钥不要写进本文件）
+#     cp .env.example .env && 编辑 .env
+#     # 2. 构建并启动
+#     docker compose up -d --build
+#     # 3. 看日志
+#     docker compose logs -f
+#
+# ── 换运行时 ────────────────────────────────────────────────────────
+#     # 在 .env 里把 DSH_RUNTIME 改成 bun，然后
+#     docker compose up -d
+#
+# 运行时是**启动时**生效的，所以切换就是"改环境变量 + 重启容器"，
+# 不需要换镜像，也不需要重新构建。两套运行时跑同一份源码。
+#
+# ── 数据持久化 ──────────────────────────────────────────────────────
+#     会话日志、SQLite 索引都落在 /data（命名卷 dsh-web-data）。
+#     删掉这个卷 = 丢掉全部历史会话。
+
+services:
+  dsh-web:
+    build:
+      context: .
+      target: runtime
+      args:
+        NODE_VERSION: "26.12.1"
+        BUN_VERSION: "1.4.4"
+    image: dsh-web:latest
+    container_name: dsh-web
+    restart: unless-stopped
+
+    ports:
+      # 宿主机端口可改；容器内固定 8787。
+      - "${DSH_WEB_PORT:-8787}:8787"
+
+    environment:
+      # ── 运行时 ─────────────────────────────────────────────────────
+      # node | bun。改这个必须重启容器才生效。
+      DSH_RUNTIME: "${DSH_RUNTIME:-node}"
+
+      # ── 会话数据目录 ───────────────────────────────────────────────
+      # 与下面的卷对应。改路径就要同步改 volumes 的挂载点。
+      DSH_WEB_HOME: /data
+
+      # ── 模型路由 ───────────────────────────────────────────────────
+      # provider 必须是 cordis.patch.yml 里注册过的路由名。
+      DSH_MODEL_PROVIDER: "${DSH_MODEL_PROVIDER:-anthropic-compat}"
+
+      # 下面三个是必填：`:?` 会在缺变量时让 compose **启动前就失败**，
+      # 而不是让容器起来之后第一次调模型才报错。
+      # 密钥只走环境变量，不进任何配置文件。
+      LLM_BASE_URL: "${LLM_BASE_URL:?必须设置 LLM_BASE_URL（Anthropic 兼容网关地址）}"
+      LLM_MODEL: "${LLM_MODEL:?必须设置 LLM_MODEL（模型 id）}"
+      LLM_API_KEY: "${LLM_API_KEY:?必须设置 LLM_API_KEY（网关密钥）}"
+
+      # vendor 决定请求头与端点细节：fuyao | minimax | 空。
+      LLM_VENDOR: "${LLM_VENDOR:-}"
+
+      # 可选：DeepSeek 原生路由与 web 搜索用的 key。不给就只走上面的兼容路由。
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+
+    volumes:
+      # 会话历史。命名卷随 `docker compose down` 保留，`down -v` 才会删。
+      - dsh-web-data:/data
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  dsh-web-data:

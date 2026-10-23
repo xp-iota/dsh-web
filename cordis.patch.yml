@@ -1,0 +1,311 @@
+# dsh-web 装配清单（cordis.patch.yml）
+#
+# 这是本工程唯一的装配来源：一个顶层 YAML 数组，内含一条 `insert`，一次性挂载
+# 全部 cordis 行。由 `src/boot.ts` 调用官方 `boot()` 应用。
+#
+# ## 本清单与 dsh-lab 的关键差异：只读对话模式
+#
+# dsh-lab 是教学实验室，需要文件与 shell 工具来演示 M07（执行后端）与 M08（委派）。
+# dsh-web 是部署到生产环境的 Web 服务，按需求**不提供文件与 shell 工具**，因此
+# 下面这份清单相对 dsh-lab 有两类删减，每一类都带来实际收益：
+#
+#   1. **删掉执行面** —— 不挂 `dsh-tool-fs` / `dsh-tool-bash` / `dsh-tool-pwsh` /
+#      `dsh-fs-sandbox` / `dsh-subprocess-local` / `dsh-sandbox-local` /
+#      `dsh-bash-sandbox` / `dsh-pwsh-sandbox` 等行。模型能对话、能搜索、能用
+#      todo 与 skill，但**不能读写真实文件、不能执行命令**。攻击面因此小一个量级：
+#      一个模型幻觉出的路径或命令，最多浪费 token，不会碰到宿主机。
+#
+#   2. **顺带消掉 Bun 的两个已知坑** —— dsh-lab 需要两个 preload shim 才能在 Bun 上
+#      跑通，因为：
+#        * `dsh-ptc-runtime-node` 是全仓唯一使用 `node:module.stripTypeScriptTypes`
+#          的包（Bun 1.4.4 尚未实现），它一挂载，Bun 侧就会**静默少 1 个工具**；
+#        * `dsh-subprocess-local` 的 runner 协议依赖脚本路径后的第一个 `--`，
+#          而 Bun 会吞掉它。
+#      本清单既不挂 workflow/PTC，也不挂 subprocess，所以**两个坑都不再触及**。
+#      `runtime/verify.mjs` 仍然断言两套运行时的工具数完全一致——这正是用来
+#      证明"不需要 shim"这个结论，而不是假设它成立。
+#
+# 保留的行分四组：模型接入、会话与轨迹、上下文工程、人机交互。
+
+- insert:
+    # ── 基础设施 ────────────────────────────────────────────────────────────
+    - id: timer
+      name: '@deepseek-ai/cordis-plugin-timer'
+
+    # ── 模型接入层 ──────────────────────────────────────────────────────────
+    - id: llm
+      name: '@deepseek-ai/dsh-llm'
+
+    # 重试策略：把 provider 的失败分类成可重试/不可重试，并做指数退避。
+    - id: llm-retry
+      name: '@deepseek-ai/dsh-llm-retry'
+
+    # Anthropic Messages 兼容网关（MiniMax / Fuyao 等）。
+    # 配置全部来自环境变量，密钥不进配置文件。
+    - id: llm-anthropic-compat
+      name: './src/services/anthropic-compat/index.ts'
+
+    # 官方 DeepSeek 原生路由（设置 DEEPSEEK_API_KEY 即可用；缺 key 时调用期报错）。
+    - id: llm-deepseek
+      name: '@deepseek-ai/dsh-llm-deepseek-api-key'
+
+    # Agent 默认走到哪条路由。可用 DSH_MODEL_PROVIDER / DSH_MODEL 覆盖。
+    - id: agent-default-model
+      name: '@deepseek-ai/dsh-agent-default-model'
+      config:
+        provider: !!js "process.env.DSH_MODEL_PROVIDER ?? 'anthropic-compat'"
+        model: !!js "process.env.DSH_MODEL ?? process.env.LLM_MODEL ?? 'MiniMax-M3'"
+
+    # ── 会话与轨迹 ──────────────────────────────────────────────────────────
+    - id: session
+      name: '@deepseek-ai/dsh-session'
+
+    # 会话日志的官方 v4 编解码（tool/call、assistant/attempt 等事件序列化）。
+    - id: session-log-deepseek
+      name: '@deepseek-ai/dsh-session-log-deepseek'
+
+    # session-log-deepseek 依赖的 DeepSeek 专有扩展字段。
+    - id: deepseek-llm-api-extensions
+      name: '@deepseek-ai/dsh-deepseek-llm-api-extensions'
+
+    # 投影注册表：turnBoundary / inbox / todo 等挂载其上。
+    - id: session-projection
+      name: '@deepseek-ai/dsh-session-projection'
+
+    # 会话标题：首条人类消息的规则回退 + 模型摘要（LLM 失败不影响主流程）。
+    - id: session-title
+      name: '@deepseek-ai/dsh-session-title'
+      config:
+        fallbackMaxWords: 5
+        fallbackMaxBytes: 40
+        maxTitleBytes: 80
+
+    # 标题的 LLM 生成走**独立**路由：session-title-llm 的 provider/model 字段
+    # 不会继承 agent 的默认模型，缺省会落到它自己的默认路由（deepseek-v4.1-flash）。
+    # 在只装了一个 Anthropic 兼容网关的部署里，那个默认路由不存在——标题生成会
+    # 404，而且因为它跑在辅助调用上，**主对话会跟着一起失败**（辅助调用与主
+    # 调用共享同一个 turn 的错误收口）。所以这里显式配上，与主对话同路由。
+    - id: session-title-llm
+      name: '@deepseek-ai/dsh-session-title-first-prompt-llm'
+      config:
+        targetWords: 5
+        targetCjkCharacters: 10
+        maxInputBytes: 4096
+        maxOutputTokens: 4096
+        timeoutMs: 60000
+        provider: !!js "process.env.DSH_MODEL_PROVIDER ?? 'anthropic-compat'"
+        model: !!js "process.env.DSH_MODEL ?? process.env.LLM_MODEL ?? 'MiniMax-M3'"
+
+    # trajectory 的落盘：每会话一份 JSONL，根目录在 DSH_HOME/sessions。
+    # 生产环境把 DSH_HOME 挂成卷，即可跨重启保留会话。
+    - id: session-persistence-jsonl
+      name: '@deepseek-ai/dsh-session-persistence-jsonl'
+      config:
+        root: !!js dshHomePath('sessions')
+
+    # trajectory 的读取：ctx.sessionQuery（精确读、标题、listSessions）。
+    # openAt: never = 不落 SQLite、不做全文索引；精确读照常可用。
+    - id: session-query-sqlite
+      name: '@deepseek-ai/dsh-session-query-sqlite'
+      config:
+        path: ':memory:'
+        openAt: never
+
+    # 会话统计与 turn 大纲：轨迹视图的汇总列。
+    - id: session-stats
+      name: '@deepseek-ai/dsh-session-stats'
+
+    - id: session-turn-outline
+      name: '@deepseek-ai/dsh-session-turn-outline'
+
+    # 模型请求前 / 顶层派发前的持久化检查点。
+    - id: session-checkpoint-policy
+      name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
+    # 投影缓存：列表页不必回放整条日志。
+    - id: session-projection-cache
+      name: '@deepseek-ai/dsh-session-projection-cache'
+      config:
+        writeEveryEvents: 200
+        writeIntervalMs: 5000
+
+    # 结构化持久化：投影缓存的底座（inject 要求 storageDomain 先就位）。
+    - id: storage
+      name: '@deepseek-ai/dsh-storage'
+
+    - id: storage-json
+      name: '@deepseek-ai/dsh-storage-json'
+      config:
+        root: !!js dshHomePath('storages')
+
+    - id: storage-domain
+      name: '@deepseek-ai/dsh-storage-domain'
+      config:
+        backend: json
+
+    # 跨会话引用：把另一条会话的快照按预算放进当前上下文。
+    - id: session-reference
+      name: '@deepseek-ai/dsh-session-reference'
+
+    # ── Agent 循环 ──────────────────────────────────────────────────────────
+    - id: agent
+      name: '@deepseek-ai/dsh-agent'
+
+    # 配置态 agent 保持空表：agent 由 Web 层在运行时按会话创建。
+    - id: agent-loop
+      name: '@deepseek-ai/dsh-agent-loop'
+      config:
+        agents: []
+
+    # ── 上下文工程 ──────────────────────────────────────────────────────────
+    - id: system-prompt
+      name: '@deepseek-ai/dsh-system-prompt'
+      config:
+        personaPrefix: !!js "process.env.DSH_SYSTEM_PROMPT ?? 'You are a web assistant powered by the dsh-web harness. Be concise and concrete.'"
+        includeHarnessIdentity: true
+        includeRuntimeContext: false
+
+    - id: token-meter
+      name: '@deepseek-ai/dsh-token-meter'
+
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    # 刻意**不挂** `@deepseek-ai/dsh-command-compact`（/compact 斜杠命令）：
+    # 它要显式压缩上下文，而自动压缩已由上面的 compaction-basic 承担；且该包的
+    # 最新版对 dsh-commands 有 peer 版本要求，与本工程锁定的 rc.2 线冲突。
+
+    # 工具结果裁剪：超大结果先截断再进入下一次请求。
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+    # 图片超预算时的降级：把最旧的图片换成占位符后重试。
+    - id: image-offload
+      name: '@deepseek-ai/dsh-compaction-image-offload'
+
+    # 大输出溢写：超过内联预算的结果落到文件，模型只看到路径与摘要。
+    - id: spill-local
+      name: '@deepseek-ai/dsh-spill-local'
+
+    - id: spill-policy
+      name: '@deepseek-ai/dsh-spill-policy'
+      config:
+        maxInlineTokens: 12500
+
+    # 连续重复调用的提醒（同一工具 + 同一参数）。
+    - id: repeat-tool-reminder
+      name: '@deepseek-ai/dsh-repeat-tool-reminder'
+      config:
+        thresholds: [3, 5, 8]
+        argumentsPreviewChars: 500
+
+    # ── 工具运行时 ──────────────────────────────────────────────────────────
+    - id: tools
+      name: '@deepseek-ai/dsh-tools'
+
+    # 工具调用超时策略：按工具名给不同预算，超时即取消。
+    - id: timeout-policy
+      name: '@deepseek-ai/dsh-tool-call-timeout-policy'
+
+    # 只读模式下保留的工具：
+    #   * todo_write —— 规划与自检，不碰文件系统；
+    #   * skill     —— 读取已注册的技能说明（只读）；
+    #   * web       —— 抓取与搜索公开信息（只读外网）；
+    #   * ask_user  —— 结构化提问，由前端渲染成选项。
+    - id: tool-todo
+      name: '@deepseek-ai/dsh-tool-todo'
+      config:
+        allowParallelInProgress: true
+
+    # 刻意**不挂** skill 与 working-directory：skill 工具需要 `workingDirectory`
+    # 服务，而它 inject 里要 `fs`（要 stat 路径来校验 cwd），会一路拖进
+    # `dsh-fs-local` 与 koffi 原生模块。只读对话模式没有工作区、也没有磁盘上的
+    # 技能可加载，这个能力对 Web 场景没有价值，却要付出一个真实文件系统访问面
+    # 与一份原生依赖——不划算。技能能力留待将来做「带工作区的 Web」时再加。
+
+    # 网络能力：匿名 fetch 默认开启；搜索需要 DEEPSEEK_API_KEY。
+    - id: web
+      name: '@deepseek-ai/dsh-web'
+      config:
+        searchProvider: deepseek-official
+        fetchProvider: http
+
+    - id: web-search-deepseek
+      name: '@deepseek-ai/dsh-web-search-deepseek'
+      config:
+        apiKeyEnv: DEEPSEEK_API_KEY
+
+    - id: web-deepseek-api
+      name: '@deepseek-ai/dsh-web-deepseek-api'
+      config:
+        apiKeyEnv: DEEPSEEK_API_KEY
+
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'
+
+    - id: tool-web
+      name: '@deepseek-ai/dsh-tool-web'
+      config:
+        fetch: true
+        searchTimeoutMs: 60000
+
+    # ── 人机交互 ────────────────────────────────────────────────────────────
+    # 审批与提问都是 waterfall：Web 层在 agent 作用域内注册处理器，把请求转成
+    # SSE 帧推给浏览器，等前端应答后 resolve。
+    - id: user-approval
+      name: '@deepseek-ai/dsh-user-approval'
+      config:
+        policy: !!js "(process.env.DSH_PERMISSION_MODE ?? 'read-only') === 'danger-full-access' ? 'never' : 'ask'"
+
+    - id: user-questions
+      name: '@deepseek-ai/dsh-user-questions'
+
+    # 模型面向的提问工具：阻塞式（legacy），由 Web 层应答。
+    - id: tool-ask-user
+      name: '@deepseek-ai/dsh-tool-ask-user'
+      config:
+        mode: legacy
+
+    - id: commands
+      name: '@deepseek-ai/dsh-commands'
+
+    # 人类反馈：/feedback 命令 + 消息级反馈记录。
+    - id: command-feedback
+      name: '@deepseek-ai/dsh-command-feedback'
+
+    - id: message-feedback
+      name: '@deepseek-ai/dsh-message-feedback'
+      config:
+        maxNoteBytes: 4096
+
+    # 计划模式：只读探索 + exit_plan_mode 审批。
+    - id: plan-mode
+      name: '@deepseek-ai/dsh-plan-mode'
+      config:
+        section: |
+          You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+          Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+          The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed only to keep the request shape stable. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+          When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval.
+
+    # 刻意**不挂** `@deepseek-ai/dsh-permission-presets`：它把 sandbox 模式与审批
+    # 策略绑在一起，inject 里有 `shell`，而只读模式根本不挂 shell/沙箱（挂了它就
+    # 永远 pending）。审批策略由下面 `user-approval` 行的 config 直接给出，
+    # 语义上等价且不依赖执行面。
+
+    # ── 凭据与诊断 ──────────────────────────────────────────────────────────
+    - id: authorization
+      name: '@deepseek-ai/dsh-authorization'
+
+    - id: credentials
+      name: '@deepseek-ai/dsh-credentials-local'
+
+    - id: invariants
+      name: '@deepseek-ai/dsh-invariants'
