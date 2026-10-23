@@ -130,16 +130,24 @@ dsh-web/
 │   ├── verify.mjs           双运行时并排校验
 │   ├── boot-probe.ts        启动探针（断言服务齐全 + 工具数 = 5）
 │   ├── status.mjs           运行时状态盘点
+│   ├── diagnose.ts          端到端诊断（真实跑一次对话并打印结果）
+│   ├── probe-config.ts      打印实际生效的模型路由配置
+│   ├── probe-route.ts       打印 agent-loop 组装出来的真实请求路由
+│   ├── probe-stack.ts       复现一次请求并打印完整错误堆栈
+│   ├── probe-env.ts         检查各层 .env 的键/值类型（只打类型，不打值）
 │   ├── runtimes.json        版本清单（唯一真相）
 │   └── lib/{runtimes,spawn}.mjs
 └── web/                     React + Vite 前端
     └── src/{App.tsx, api.ts, components/*, styles.css}
 ```
 
+> `runtime/probe-*.ts` 是排障时写的探针。保留它们是因为每个都回答一个会反复出现的
+> 运维问题——「实际生效的是哪条路由」「这个报错从哪儿抛的」「哪一层的 .env 类型不对」——
+> 而这些问题靠读代码看不出来。**它们只打印类型与结构，不打印任何密钥值。**
+
 ---
 
 ## 本地开发
-
 ```bash
 cd dsh-web
 npm install                    # 装依赖
@@ -227,22 +235,37 @@ RUNTIMES_VERIFY_OK runtimes=2 checks=7
 ### 构建
 
 ```bash
-docker build -t dsh-web:latest .
+docker build --target runtime -t dsh-web:latest .
 ```
 
-4 个阶段：
+阶段划分：
+
+```
+base ──> deps ──┐
+      └─> web ──┼──> runtime   ← 默认目标，最终镜像
+                 └──> verify        ← 可选目标，在镜像内跑双运行时校验
+```
 
 | 阶段 | 作用 | 进入最终镜像 |
 |:--|:--|:--|
+| `base` | Node 26.12.1 + Bun 1.4.4 并存 | ✓（两者都进） |
 | `deps` | `npm ci --omit=dev` 装后端生产依赖 | ✓（只拷 node_modules） |
 | `web` | `npm ci` + `tsc -b && vite build` 产出 `web/dist` | ✓（只拷 dist） |
-| `runtime` | Node + Bun 并存的最终镜像 | — |
+| `runtime` | 非 root、卷 `/data`、健康检查、入口脚本 | — |
 | `verify` | 在镜像**内部**再跑一遍双运行时校验 | ✗（独立目标） |
 
 ```bash
 # 顺带验证镜像里的两套运行时
 docker build --target verify -t dsh-web:verify .
 ```
+
+> BuildKit 的默认目标是**文件里最后一个阶段**，所以 `runtime` 必须排在最后，
+> 否则 `docker build .` 建出来的是别的东西。
+
+> ⚠️ `base` 阶段**故意不设 `NODE_ENV=production`**：npm 会拿 `NODE_ENV` 决定要不要装
+> devDependencies，一旦设了，后面 `npm ci` 想装 typescript 就会静默地装不上
+> （表现为 verify 阶段报「找不到 typescript」）。需要 devDependencies 的阶段
+> 显式写 `--include=dev`。
 
 ### 运行
 
@@ -300,6 +323,79 @@ handler，把 SIGTERM / SIGINT **转发**给真正跑服务的子进程，等它
 （flush 会话日志、关 SQLite）后才退出。
 
 少了这一步，`docker stop` 只能等超时后 SIGKILL，会话数据会丢。
+
+---
+
+## 验证状态
+
+以下都是**实际执行过**的结果，不是设计意图。
+
+### 镜像内双运行时校验
+
+```
+$ docker build --target verify -t dsh-web:verify .
+#17 4.101 node        26.12.1     typecheck    ✓ exit 0
+#17 4.101 node        26.12.1     test         ✓ 12 pass / 0 fail
+#17 4.101 node        26.12.1     boot         ✓ services ok, tools 5
+#17 4.101 bun         1.4.4       typecheck    ✓ exit 0
+#17 4.102 bun         1.4.4       test         ✓ 12 pass / 0 fail
+#17 4.102 bun         1.4.4       boot         ✓ services ok, tools 5
+#17 4.102 cross       -           parity       ✓ 两套运行时工具数一致（5）
+#17 4.103 RUNTIMES_VERIFY_OK runtimes=2 checks=7
+```
+
+### 容器内的启动探针
+
+```
+$ docker run --rm --entrypoint node dsh-web:latest runtime/boot-probe.ts
+BOOT_PROBE {"missing":[],"tools":5,"toolNames":["web_search","web_fetch","todo_write","exit_plan_mode","ask_user_question"],"runtime":"node","version":"26.12.1"}
+
+$ docker run --rm --entrypoint bun dsh-web:latest runtime/boot-probe.ts
+BOOT_PROBE {"missing":[],"tools":5,"toolNames":[...],"runtime":"bun","version":"1.4.4"}
+```
+
+### 运行时切换（只改环境变量，不换镜像）
+
+```
+$ docker run -d -p 8796:8787 -e DSH_RUNTIME=bun dsh-web:latest
+$ curl http://127.0.0.1:8796/api/health
+{"ok":true,"runtime":{"name":"bun","version":"1.4.4"},"tools":5,"providers":["anthropic-compat","deepseek-official"],"version":"0.1.0"}
+```
+
+### 真实模型端到端（容器内）
+
+一次真实对话的完整轨迹：
+
+```json
+{
+  "title": "一句话解释闭包",
+  "transcript": [
+    {"kind":"user","text":"用一句话说明什么是闭包"},
+    {"kind":"assistant","text":"闭包是由函数以及该函数被创建时所处的词法环境共同组成的实体……"}
+  ],
+  "trajectory": {
+    "eventCount": 14,
+    "turns": [{"number":1,"steps":1,"toolCalls":0,"outputTokens":73,"reason":"completed","durationMs":851}]
+  }
+}
+```
+
+SSE 流式在容器内逐帧到达（`assistant/reasoning` → `assistant/delta` → `assistant/block-end`
+→ `turn/end {reason:"completed"}`），心跳注释帧每 25 秒一条。
+
+### 优雅退出
+
+```
+$ docker stop -t 20 dsh-web-bun
+收到 SIGTERM，正在释放…
+已释放。
+$ docker inspect dsh-web-bun --format '{{.State.ExitCode}}'
+0
+```
+
+### 持久化
+
+容器重启后，会话列表与模型生成的标题仍在（数据在卷 `/data` 的 `sessions/` 与 `storages/`）。
 
 ---
 

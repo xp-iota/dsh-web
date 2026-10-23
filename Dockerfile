@@ -18,11 +18,11 @@
 #
 #   3. **前端产物由同一个进程托管**。
 #      `src/server/main.ts` 的 serveStatic 直接发 `web/dist`，部署是单容器
-#      单进程，不需要再挂一层 Nginx 或 Caddy。
+#      单进程，不需要再挂 Nginx 或 Caddy。
 #
 # ── 构建 ────────────────────────────────────────────────────────────
-#     docker build -t dsh-web:latest .
-#     docker build -t dsh-web:latest --target verify .   # 顺带跑双运行时校验
+#     docker build -t dsh-web:latest .                 # 默认目标 = runtime
+#     docker build --target verify -t dsh-web:verify . # 顺带跑双运行时校验
 #
 # ── 运行 ────────────────────────────────────────────────────────────
 #     docker run -d -p 8787:8787 \
@@ -37,18 +37,47 @@
 #
 # 运行时切换是**启动时**生效的：改 `DSH_RUNTIME` 后必须重启容器。
 # 两套运行时跑的是同一份源码（`src/server/main.ts`），没有各自的分支。
+#
+# ── 阶段顺序 ────────────────────────────────────────────────────────
+#
+# BuildKit 的默认目标是**文件里最后一个阶段**。所以 `runtime` 必须排在最后，
+# 否则 `docker build .` 建出来的是别的东西。本文件的顺序是：
+#
+#     base ──> deps ──┐
+#           └─> web ──┼──> runtime   ← 默认目标，最终镜像
+#                  └──> verify        ← 可选目标，在镜像内跑双运行时校验
+#
+# `verify` 与 `runtime` 是 `base` 的兄弟节点，不是它的后继 —— 这样既能让
+# `runtime` 当默认目标，又不用把两套运行时重复装两遍。
 
 ARG NODE_VERSION=26.12.1
 ARG BUN_VERSION=1.4.4
 
 # ─────────────────────────────────────────────────────────────────────
-# 阶段 1/4：后端生产依赖
+# 基础阶段：Node + Bun
+#
+# Node 来自官方镜像；Bun 通过 npm 官方包安装（`bun` 包用 optionalDependencies
+# 分发各平台的预编译二进制，不需要在镜像里下 GitHub release、不需要 unzip、
+# 不需要编译）。
+#
+# 这个阶段**故意不设 NODE_ENV=production**：npm 会拿 NODE_ENV 决定要不要装
+# devDependencies，一旦设了，后面 `npm ci` 想装 typescript 就会静默地装不上。
+# 需要 devDependencies 的阶段（verify）显式写 `--include=dev`。
+# ─────────────────────────────────────────────────────────────────────
+FROM node:${NODE_VERSION}-bookworm-slim AS base
+ARG BUN_VERSION
+RUN npm install -g "bun@${BUN_VERSION}" \
+ && bun --version \
+ && node --version
+
+# ─────────────────────────────────────────────────────────────────────
+# 阶段：后端生产依赖
 #
 # 只装 `dependencies`，`devDependencies`（typescript / @types/node）不进来。
 # 单独一层的目的只有一个：package.json / package-lock.json 变了才重装，
 # 改源码不会让 npm 重跑一遍。
 # ─────────────────────────────────────────────────────────────────────
-FROM node:${NODE_VERSION}-bookworm-slim AS deps
+FROM base AS deps
 WORKDIR /app
 
 # 只拷清单：源码不进这一层，依赖安装因此可以稳定命中缓存。
@@ -57,11 +86,11 @@ RUN npm ci --omit=dev --no-audit --no-fund \
  && npm cache clean --force
 
 # ─────────────────────────────────────────────────────────────────────
-# 阶段 2/4：前端构建
+# 阶段：前端构建
 #
 # 用与后端同一个 Node 大版本构建，避免出现"构建机装得下、运行时跑不动"。
 # ─────────────────────────────────────────────────────────────────────
-FROM node:${NODE_VERSION}-bookworm-slim AS web
+FROM base AS web
 WORKDIR /app/web
 
 COPY web/package.json web/package-lock.json ./
@@ -72,14 +101,29 @@ COPY web/ ./
 RUN npm run build
 
 # ─────────────────────────────────────────────────────────────────────
-# 阶段 3/4：运行时镜像
+# 阶段：校验（可选目标，`--target verify`）
 #
-# 这里才是最终镜像。Node 来自基础镜像；Bun 通过 npm 官方包安装
-# （`bun` 包带各平台的预编译二进制，走 optionalDependencies 分发，
-#  不需要在镜像里下 GitHub release、不需要 unzip、不需要编译）。
+# 在**镜像内部**再跑一遍双运行时校验（typecheck + test + 启动探针），
+# 证明这台机器上的 Node 和 Bun 都能把只读服务树完整拉起来、且工具数一致。
+#
+# `--include=dev` 不能省：typescript 在 devDependencies 里。
 # ─────────────────────────────────────────────────────────────────────
-FROM node:${NODE_VERSION}-bookworm-slim AS runtime
-ARG BUN_VERSION
+FROM base AS verify
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --include=dev --no-audit --no-fund
+
+COPY tsconfig.json cordis.yml cordis.patch.yml ./
+COPY src ./src
+COPY runtime ./runtime
+# 这一步会打印 RUNTIMES_VERIFY_OK runtimes=2 checks=7；不绿则构建失败。
+RUN node runtime/verify.mjs
+
+# ─────────────────────────────────────────────────────────────────────
+# 阶段：运行时镜像（默认目标）
+# ─────────────────────────────────────────────────────────────────────
+FROM base AS runtime
 
 ENV NODE_ENV=production \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
@@ -89,12 +133,6 @@ ENV NODE_ENV=production \
     DSH_RUNTIME=node
 
 WORKDIR /app
-
-# 两套运行时并存。装完立刻验证版本 —— 版本不对时要在**构建期**失败，
-# 而不是等到容器启动才报一个跟运行时无关的错。
-RUN npm install -g "bun@${BUN_VERSION}" \
- && bun --version \
- && node --version
 
 # 后端：生产依赖 + 源码 + 装配清单 + 运行时调度层。
 COPY --from=deps /app/node_modules ./node_modules
@@ -124,22 +162,3 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["dsh-web-entrypoint"]
-
-# ─────────────────────────────────────────────────────────────────────
-# 阶段 4/4：校验（可选目标）
-#
-#     docker build --target verify -t dsh-web:verify .
-#
-# 在**镜像内部**再跑一遍双运行时校验（typecheck + test + 启动探针），
-# 证明这台机器上的 Node 和 Bun 都能把只读服务树完整拉起来、且工具数一致。
-# 需要 devDependencies（typescript），所以单独一个目标，不进最终镜像。
-# ─────────────────────────────────────────────────────────────────────
-FROM runtime AS verify
-USER root
-WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --no-audit --no-fund
-COPY tsconfig.json ./
-COPY src ./src
-# 这一步会打印 RUNTIMES_VERIFY_OK runtimes=2 checks=7；不绿则构建失败。
-RUN node runtime/verify.mjs

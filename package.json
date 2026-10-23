@@ -29,7 +29,9 @@
     "//verify": "两套运行时各跑 typecheck / test / 启动探针，末行打印 RUNTIMES_VERIFY_OK。",
     "verify": "node runtime/verify.mjs",
     "//docker": "构建生产镜像（内含 Node 与 Bun 两套运行时，DSH_RUNTIME 决定用哪个）。",
-    "docker:build": "docker build -t dsh-web:latest ."
+    "docker:build": "docker build --target runtime -t dsh-web:latest .",
+    "//docker:verify": "在镜像内部再跑一遍双运行时校验（typecheck + test + 启动探针 + 跨运行时一致性）。",
+    "docker:verify": "docker build --target verify -t dsh-web:verify ."
   },
   "//dependencies": "只读对话模式的依赖子集：不含任何 fs/bash/subprocess/workflow 包，因此 Bun 侧不需要 dsh-lab 的两个 preload shim。",
   "dependencies": {
